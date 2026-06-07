@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CAT'S CRADLE // NEON HANDS</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+    color: #0ff;
+  }
+  #ui-overlay {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #header {
+    position: fixed;
+    top: 20px; left: 50%;
+    transform: translateX(-50%);
+    text-align: center;
+    z-index: 20;
+    pointer-events: none;
+  }
+  #header h1 {
+    font-size: 13px;
+    letter-spacing: 8px;
+    color: #0ff;
+    text-shadow: 0 0 10px #0ff, 0 0 20px #0ff;
+    opacity: 0.7;
+    text-transform: uppercase;
+  }
+  #status {
+    position: fixed;
+    bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    letter-spacing: 4px;
+    color: #0ff8;
+    text-shadow: 0 0 8px #0ff;
+    z-index: 20;
+    pointer-events: none;
+  }
+  #scanlines {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.15) 2px,
+      rgba(0,0,0,0.15) 4px
+    );
+    pointer-events: none;
+    z-index: 5;
+  }
+  #vignette {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: radial-gradient(ellipse at center, transparent 50%, rgba(0,0,20,0.85) 100%);
+    pointer-events: none;
+    z-index: 4;
+  }
+  canvas { display: block; }
+  #main-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    z-index: 3;
+  }
+  video {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+    opacity: 0;
+    z-index: 1;
+  }
+  #loading {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    z-index: 30;
+  }
+  #loading p {
+    font-size: 11px;
+    letter-spacing: 6px;
+    color: #0ff;
+    text-shadow: 0 0 10px #0ff;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+  }
+  .corner {
+    position: fixed;
+    width: 20px; height: 20px;
+    opacity: 0.4;
+    z-index: 20;
+    pointer-events: none;
+  }
+  .corner.tl { top: 12px; left: 12px; border-top: 1px solid #0ff; border-left: 1px solid #0ff; }
+  .corner.tr { top: 12px; right: 12px; border-top: 1px solid #0ff; border-right: 1px solid #0ff; }
+  .corner.bl { bottom: 12px; left: 12px; border-bottom: 1px solid #0ff; border-left: 1px solid #0ff; }
+  .corner.br { bottom: 12px; right: 12px; border-bottom: 1px solid #0ff; border-right: 1px solid #0ff; }
+</style>
+</head>
+<body>
+
+<video id="webcam" autoplay playsinline></video>
+<canvas id="main-canvas"></canvas>
+
+<div id="scanlines"></div>
+<div id="vignette"></div>
+
+<div class="corner tl"></div>
+<div class="corner tr"></div>
+<div class="corner bl"></div>
+<div class="corner br"></div>
+
+<div id="header">
+  <h1>CAT'S CRADLE &nbsp;/&nbsp; NEURAL STRINGS</h1>
+</div>
+
+<div id="loading">
+  <p>INITIALIZING HAND TRACKING...</p>
+</div>
+
+<div id="status" id="status-text">AWAITING HANDS</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script type="module">
+import {
+  FilesetResolver,
+  HandLandmarker
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video = document.getElementById('webcam');
+const mainCanvas = document.getElementById('main-canvas');
+const ctx = mainCanvas.getContext('2d');
+const loadingEl = document.getElementById('loading');
+const statusEl = document.getElementById('status');
+
+let handLandmarker = null;
+let lastVideoTime = -1;
+let results = null;
+let W, H;
+
+// Particle system
+const particles = [];
+
+function resize() {
+  W = mainCanvas.width = window.innerWidth;
+  H = mainCanvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Fingertip landmark indices
+const FINGERTIPS = [4, 8, 12, 16, 20];
+// All landmark indices for joints
+const ALL_JOINTS = Array.from({length: 21}, (_, i) => i);
+
+// Finger connections for skeleton
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+
+async function init() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 2
+  });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }
+  });
+  video.srcObject = stream;
+  await new Promise(res => video.addEventListener('loadeddata', res, { once: true }));
+
+  loadingEl.style.display = 'none';
+  requestAnimationFrame(loop);
+}
+
+// Elastic string state
+const stringState = {
+  positions: Array(5).fill(null).map(() => ({ x: 0, y: 0, vx: 0, vy: 0 })),
+  targets: Array(5).fill(null).map(() => ({ x: 0, y: 0 }))
+};
+
+// Hue animation
+let hueOffset = 0;
+
+function lmToCanvas(lm) {
+  // Mirror horizontally to match mirrored video
+  return {
+    x: (1 - lm.x) * W,
+    y: lm.y * H
+  };
+}
+
+// Spawn particles at a point
+function spawnParticles(x, y, color) {
+  for (let i = 0; i < 14; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 4;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1,
+      decay: 0.03 + Math.random() * 0.04,
+      size: 2 + Math.random() * 4,
+      color
+    });
+  }
+}
+
+function drawGlowLine(x1, y1, x2, y2, color, lineWidth, blur) {
+  ctx.save();
+  ctx.shadowBlur = blur;
+  ctx.shadowColor = color;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawGlowDot(x, y, radius, color, blur) {
+  ctx.save();
+  ctx.shadowBlur = blur;
+  ctx.shadowColor = color;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function hslStr(h, s, l, a = 1) {
+  return `hsla(${h % 360},${s}%,${l}%,${a})`;
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function loop(timestamp) {
+  requestAnimationFrame(loop);
+  hueOffset = (hueOffset + 0.4) % 360;
+
+  // Draw video frame to canvas
+  ctx.save();
+  ctx.translate(W, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, W, H);
+  ctx.restore();
+
+  // Dark overlay for futuristic look
+  ctx.fillStyle = 'rgba(0, 0, 20, 0.65)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Run hand detection
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    results = handLandmarker.detectForVideo(video, timestamp);
+  }
+
+  let leftHand = null, rightHand = null;
+
+  if (results && results.landmarks && results.landmarks.length > 0) {
+    loadingEl.style.display = 'none';
+
+    results.landmarks.forEach((lms, idx) => {
+      // MediaPipe labels: results.handedness[idx][0].categoryName
+      const handedness = results.handedness[idx][0].categoryName; // "Left" or "Right"
+      // Since video is mirrored, swap
+      if (handedness === 'Left') rightHand = lms;
+      else leftHand = lms;
+
+      // Draw skeleton connections
+      CONNECTIONS.forEach(([a, b]) => {
+        const pa = lmToCanvas(lms[a]);
+        const pb = lmToCanvas(lms[b]);
+        const hue = (hueOffset + idx * 60) % 360;
+        drawGlowLine(pa.x, pa.y, pb.x, pb.y, hslStr(hue, 100, 70, 0.35), 1.5, 8);
+      });
+
+      // Draw joints
+      ALL_JOINTS.forEach((ji) => {
+        const p = lmToCanvas(lms[ji]);
+        const isTip = FINGERTIPS.includes(ji);
+        const hue = (hueOffset + idx * 60 + ji * 8) % 360;
+        if (isTip) {
+          drawGlowDot(p.x, p.y, 7, hslStr(hue, 100, 80), 24);
+          drawGlowDot(p.x, p.y, 3, '#fff', 6);
+        } else {
+          drawGlowDot(p.x, p.y, 3.5, hslStr(hue, 100, 70, 0.8), 12);
+        }
+      });
+    });
+
+    statusEl.textContent = results.landmarks.length === 2
+      ? 'BOTH HANDS DETECTED // STRINGS ACTIVE'
+      : 'ONE HAND DETECTED // AWAITING SECOND HAND';
+  } else {
+    statusEl.textContent = 'AWAITING HANDS';
+  }
+
+  // Draw strings between hands
+  if (leftHand && rightHand) {
+    FINGERTIPS.forEach((fi, i) => {
+      const lp = lmToCanvas(leftHand[fi]);
+      const rp = lmToCanvas(rightHand[fi]);
+
+      const d = dist(lp, rp);
+      const maxDist = Math.hypot(W, H) * 0.6;
+      const t = Math.min(d / maxDist, 1);
+
+      // Color: interpolate cyan→magenta→yellow based on distance
+      const hue1 = 180 + t * 120; // cyan to magenta
+      const hue2 = (hueOffset + i * 72) % 360;
+      const thickness = Math.max(0.5, 3 - t * 2);
+      const blur = 10 + t * 20;
+
+      // Outer glow line
+      const grad = ctx.createLinearGradient(lp.x, lp.y, rp.x, rp.y);
+      grad.addColorStop(0, hslStr(hue2, 100, 70, 0.9));
+      grad.addColorStop(0.5, hslStr((hue2 + 60) % 360, 100, 80, 1));
+      grad.addColorStop(1, hslStr((hue2 + 120) % 360, 100, 70, 0.9));
+
+      ctx.save();
+      ctx.shadowBlur = blur + 15;
+      ctx.shadowColor = hslStr(hue2, 100, 70);
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = thickness + 2;
+      ctx.lineCap = 'round';
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(lp.x, lp.y);
+      ctx.lineTo(rp.x, rp.y);
+      ctx.stroke();
+
+      // Core line
+      ctx.shadowBlur = blur;
+      ctx.shadowColor = hslStr(hue1, 100, 80);
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = thickness;
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.moveTo(lp.x, lp.y);
+      ctx.lineTo(rp.x, rp.y);
+      ctx.stroke();
+      ctx.restore();
+
+      // Particle explosion on touch
+      if (d < 30) {
+        const midX = (lp.x + rp.x) / 2;
+        const midY = (lp.y + rp.y) / 2;
+        if (Math.random() < 0.4) {
+          spawnParticles(midX, midY, hslStr(hue2, 100, 80));
+        }
+        // Touch flash
+        drawGlowDot(midX, midY, 12, hslStr(hue2, 100, 90, 0.8), 40);
+      }
+    });
+  }
+
+  // Update & draw particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.08; // gravity
+    p.vx *= 0.97;
+    p.life -= p.decay;
+
+    if (p.life <= 0) {
+      particles.splice(i, 1);
+      continue;
+    }
+
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = p.color;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+init().catch(err => {
+  loadingEl.innerHTML = `<p style="color:#f0f;font-size:11px;letter-spacing:4px;">ERROR: ${err.message}</p>`;
+  console.error(err);
+});
+</script>
+</body>
+</html>
